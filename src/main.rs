@@ -3,8 +3,6 @@ use libc::{ioctl, open};
 use std::ffi::CString;
 use std::os::fd::AsRawFd;
 use std::process::exit;
-
-
 use libc::{
     close, lseek, mmap, munmap, PROT_WRITE, MAP_SHARED, O_RDWR, SEEK_SET,
 
@@ -12,9 +10,24 @@ use libc::{
 use std::fs::File;
 use std::io::{self, Read};
 use std::mem::zeroed;
+use byteorder::{ReadBytesExt, LittleEndian};
 use std::ptr::null_mut;
 
-#[repr(C, packed)]
+
+static mut FB_FIX: fb_fix_screeninfo = unsafe { zeroed() };
+static mut FB_VAR: fb_var_screeninfo = unsafe { zeroed() };
+static mut SCREEN_BASE: *mut u32 = null_mut();
+
+// Define your BMP file header struct without `packed`
+struct BmpFileHeader {
+    type_field: [u8; 2], // 'BM'
+    size: u32,
+    reserved1: u16,
+    reserved2: u16,
+    offset: u32,
+}
+
+// Define your BMP info header struct
 struct BmpInfoHeader {
     size: u32,
     width: i32,
@@ -29,52 +42,50 @@ struct BmpInfoHeader {
     clr_important: u32,
 }
 
-static mut FB_FIX: fb_fix_screeninfo = unsafe { zeroed() };
-static mut FB_VAR: fb_var_screeninfo = unsafe { zeroed() };
-static mut SCREEN_BASE: *mut u32 = null_mut();
+fn read_bmp_header(file: &mut File) -> io::Result<BmpFileHeader> {
+    let mut type_field = [0u8; 2];
+    file.read_exact(&mut type_field)?;
 
-#[repr(C, packed)]
-struct BmpFileHeader {
-    type_field: [u8; 2],
-    size: u32,
-    reserved1: u16,
-    reserved2: u16,
-    offset: u32,
+    let size = file.read_u32::<LittleEndian>()?;
+    let reserved1 = file.read_u16::<LittleEndian>()?;
+    let reserved2 = file.read_u16::<LittleEndian>()?;
+    let offset = file.read_u32::<LittleEndian>()?;
+
+    Ok(BmpFileHeader {
+        type_field,
+        size,
+        reserved1,
+        reserved2,
+        offset,
+    })
 }
 
-fn read_bmp_header(file: &mut File) -> io::Result<BmpFileHeader> {
-    let mut file_h = BmpFileHeader {
-        type_field: [0; 2],
-        size: 0,
-        reserved1: 0,
-        reserved2: 0,
-        offset: 0,
-    };
+fn read_bmp_info(file: &mut File) -> io::Result<BmpInfoHeader> {
+    let size = file.read_u32::<LittleEndian>()?;
+    let width = file.read_i32::<LittleEndian>()?;
+    let height = file.read_i32::<LittleEndian>()?;
+    let planes = file.read_u16::<LittleEndian>()?;
+    let bpp = file.read_u16::<LittleEndian>()?;
+    let compression = file.read_u32::<LittleEndian>()?;
+    let image_size = file.read_u32::<LittleEndian>()?;
+    let x_pels_per_meter = file.read_i32::<LittleEndian>()?;
+    let y_pels_per_meter = file.read_i32::<LittleEndian>()?;
+    let clr_used = file.read_u32::<LittleEndian>()?;
+    let clr_important = file.read_u32::<LittleEndian>()?;
 
-    // Read type_field (2 bytes)
-    file.read_exact(&mut file_h.type_field)?;
-
-    // Read size (4 bytes)
-    let mut size_bytes = [0u8; 4];
-    file.read_exact(&mut size_bytes)?;
-    file_h.size = u32::from_le_bytes(size_bytes);
-
-    // Read reserved1 (2 bytes)
-    let mut reserved1_bytes = [0u8; 2];
-    file.read_exact(&mut reserved1_bytes)?;
-    file_h.reserved1 = u16::from_le_bytes(reserved1_bytes);
-
-    // Read reserved2 (2 bytes)
-    let mut reserved2_bytes = [0u8; 2];
-    file.read_exact(&mut reserved2_bytes)?;
-    file_h.reserved2 = u16::from_le_bytes(reserved2_bytes);
-
-    // Read offset (4 bytes)
-    let mut offset_bytes = [0u8; 4];
-    file.read_exact(&mut offset_bytes)?;
-    file_h.offset = u32::from_le_bytes(offset_bytes);
-
-    Ok(file_h)
+    Ok(BmpInfoHeader {
+        size,
+        width,
+        height,
+        planes,
+        bpp,
+        compression,
+        image_size,
+        x_pels_per_meter,
+        y_pels_per_meter,
+        clr_used,
+        clr_important,
+    })
 }
 
 fn show_bmp_image(path: &str) -> i32 {
@@ -88,40 +99,30 @@ fn show_bmp_image(path: &str) -> i32 {
             }
         };
 
-        let mut file_h: BmpFileHeader = zeroed();
-        if file.read_exact(&mut file_h.type_field).is_err()
-            || file.read_exact(&mut file_h.size.to_le_bytes()).is_err()
-            || file.read_exact(&mut file_h.reserved1.to_le_bytes()).is_err()
-            || file.read_exact(&mut file_h.reserved2.to_le_bytes()).is_err()
-            || file.read_exact(&mut file_h.offset.to_le_bytes()).is_err()
-        {
-            eprintln!("read error");
-            return -1;
-        }
-        // print the file header all items on one line
-        let type_field = file_h.type_field;
-        let size = file_h.size;
-        let reserved1 = file_h.reserved1;
-        let reserved2 = file_h.reserved2;
-        let offset = file_h.offset;
-        print!("type_field: {:?}, size: {}, reserved1: {}, reserved2: {}, offset: {}\n", type_field, size, reserved1, reserved2, offset);
+        let mut file_h: BmpFileHeader = read_bmp_header(&mut file).unwrap();
+
+        println!("BMP Header:");
+        println!("Type: {:?}", file_h.type_field);
+        println!("Size: {}", file_h.size);
+        println!("Reserved1: {}", file_h.reserved1);
+        println!("Reserved2: {}", file_h.reserved2);
+        println!("Offset: {}", file_h.offset);
+    
+       
 
         if &file_h.type_field != b"BM" {
             eprintln!("it's not a BMP file");
             return -1;
         }
 
-        let mut info_h: BmpInfoHeader = zeroed();
+        let info_h: BmpInfoHeader = read_bmp_info(&mut file).unwrap();
+        // print the info on one line
+        println!(
+            "BMP Info: size: {}, width: {}, height: {}, planes: {}, bpp: {}, compression: {}, image_size: {}, x_pels_per_meter: {}, y_pels_per_meter: {}, clr_used: {}, clr_important: {}",
+            info_h.size, info_h.width, info_h.height, info_h.planes, info_h.bpp, info_h.compression, info_h.image_size, info_h.x_pels_per_meter, info_h.y_pels_per_meter, info_h.clr_used, info_h.clr_important
+        );
         // Read remaining bmp_info_header fields
-        if let Err(e) = read_bmp_header(&mut file, &mut file_h) {
-            eprintln!("Failed to read BMP header: {}", e);
-            return -1;
-        }
-        let size = info_h.size; 
-        let width = info_h.width;
-        let height = info_h.height;
-        print!("size: {}\n", size);
-        print!("width: {}, height: {}\n", width, height);
+        
 
         if lseek(file.as_raw_fd(), file_h.offset as i32, SEEK_SET) == -1 {
             eprintln!("lseek error");
